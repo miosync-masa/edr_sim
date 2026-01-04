@@ -15,7 +15,8 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import matplotlib.colors as mcolors
 
 # ローカルモジュール
-from materials import Material
+from materials import get_material
+from physics_engine import PhysicsEngine, create_engine
 from mesh_loader import load_dxf, PressMesh
 from strain_calc import estimate_strain_from_geometry
 from u2_engine import U2Engine, MultiStepAnalyzer
@@ -226,18 +227,19 @@ def main():
     
     # 3. 材料設定
     print("\n[3] Setting up material (SECD t=1.96mm)...")
-    material = Material('SECD')
+    physics = create_engine('SECD')
+    mat = physics.mat
     thickness = 1.96  # mm
     
-    print(f"  {material}")
-    print(f"  Structure: {material.data['structure']}, Z_bulk: {material.data['Z_bulk']}")
-    print(f"  fG (Born): {material.data['fG']}, δ_L: {material.data['delta_L']}")
-    print(f"  FLC₀ (t={thickness}mm): {material.compute_FLC0(thickness)*100:.1f}%")
-    print(f"  n-value: {material.data['n_value']}, r-value: {material.data['r_value']}")
+    print(f"  Material: {mat['name']} ({mat['structure']})")
+    print(f"  Structure: {mat['structure']}, Z_bulk: {mat['Z_bulk']}")
+    print(f"  δ_L: {mat['delta_L']}")
+    print(f"  FLC₀ (t={thickness}mm): {physics.compute_FLC0(thickness)*100:.1f}%")
+    print(f"  n-value: {mat['n_value']}, r-value: {mat['r_value']}")
     
     # 4. U²解析実行
     print("\n[4] Running Λ-Dynamics analysis...")
-    analyzer = MultiStepAnalyzer(material, thickness_mm=thickness)
+    analyzer = MultiStepAnalyzer(physics, thickness_mm=thickness)
     results = analyzer.analyze_process(meshes, strain_history)
     
     # 5. 結果サマリ
