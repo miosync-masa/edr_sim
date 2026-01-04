@@ -569,8 +569,8 @@ if __name__ == "__main__":
     
     # 結果を可視化
     fig = sim.plot_results(results_300K)
-    fig.savefig('/mnt/user-data/outputs/tensile_test_v2_300K.png', dpi=150)
-    print(f"\nSaved: /mnt/user-data/outputs/tensile_test_v2_300K.png")
+    fig.savefig('/content/tensile_test_v2_300K.png', dpi=150)
+    print(f"\nSaved: /contents/tensile_test_v2_300K.png")
     
     # 高温試験
     print("\n### High Temperature Test (T=1000K) ###")
@@ -587,8 +587,8 @@ if __name__ == "__main__":
     )
     
     fig2 = sim2.plot_results(results_1000K)
-    fig2.savefig('/mnt/user-data/outputs/tensile_test_v2_1000K.png', dpi=150)
-    print(f"Saved: /mnt/user-data/outputs/tensile_test_v2_1000K.png")
+    fig2.savefig('/content/tensile_test_v2_1000K.png', dpi=150)
+    print(f"Saved: /content/tensile_test_v2_1000K.png")
     
     # サマリ
     print("\n" + "="*70)
