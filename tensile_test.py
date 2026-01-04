@@ -281,13 +281,13 @@ class TensileTestSimulator:
         λ ≥ 1 かつ:
           引張 (vol > 0) → CRACK
           圧縮 (vol < 0) → PLASTIC
-          中間 → NECKING
+          中間 (|vol| ≈ 0) → NECKING (純粋せん断)
         """
         fate = np.full(self.N, AtomFate.STABLE, dtype=object)
         
-        # 歪み速度が高いと閾値が下がる
-        rate_factor = 1.0 / (1.0 + 10 * strain_rate)
-        threshold = 0.05 * rate_factor
+        # 閾値を小さく: 引張試験でのポアソン効果を考慮
+        # vol_strain ≈ ε(1 - 2ν) ≈ 0.3ε for ν≈0.35
+        threshold = 0.001  # 0.1% 以上の体積変化でCRACK/PLASTIC判定
         
         unstable = lam >= 1.0
         
@@ -396,9 +396,13 @@ class TensileTestSimulator:
     def run_full_test(self, 
                        max_strain: float = 0.3,
                        n_steps: int = 30,
-                       T: float = 300.0) -> List[dict]:
+                       T: float = 300.0,
+                       stop_on_fracture: bool = True) -> List[dict]:
         """
         引張試験をフル実行
+        
+        Args:
+            stop_on_fracture: Falseならヒートマップ用に最後まで走らせる
         """
         print(f"\n{'='*60}")
         print(f"Running tensile test: max_strain={max_strain}, steps={n_steps}")
@@ -407,6 +411,9 @@ class TensileTestSimulator:
         
         results = []
         disp_per_step = max_strain * self.Ly / n_steps
+        
+        # CAD連携用：各原子が初めてλ>1になったステップを記録
+        first_unstable_step = np.full(self.N, -1, dtype=int)  # -1 = never unstable
         
         for step in range(n_steps):
             result = self.run_step(disp_per_step, T)
@@ -422,6 +429,10 @@ class TensileTestSimulator:
             frac_unstable = (lam > 1.0).sum() / len(lam) * 100
             n_crack = result['counts'][AtomFate.CRACK]
             
+            # 初めてλ>1になった原子を記録（ヒートマップ用）
+            newly_unstable = (lam >= 1.0) & (first_unstable_step < 0)
+            first_unstable_step[newly_unstable] = step + 1  # 1-indexed
+            
             if step % 5 == 0 or frac_unstable > 50:
                 print(f"Step {step+1:3d}: ε={strain:5.1f}%, λ_max={lam_max:.2f}, "
                       f"λ_mean={lam_mean:.2f}, unstable={frac_unstable:.0f}%")
@@ -429,7 +440,14 @@ class TensileTestSimulator:
             # 破断判定: 50%以上の原子が λ > 1
             if frac_unstable > 50:
                 print(f"\n*** FRACTURE at ε = {strain:.1f}% (>50% atoms unstable) ***")
-                break
+                if stop_on_fracture:
+                    break
+        
+        # 最終結果にヒートマップ情報を追加
+        if results:
+            results[-1]['first_unstable_step'] = first_unstable_step
+            results[-1]['n_steps_run'] = len(results)
+            results[-1]['total_steps'] = n_steps
         
         return results
     
