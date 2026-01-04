@@ -5,20 +5,40 @@
 統一物理エンジン - 全ての計算ロジックを1箇所に
 
 Components:
-  1. Geometry     - 格子定数、原子間距離、数密度
-  2. Born Collapse - 熱軟化（剛性率の温度崩壊）
-  3. Debye-Waller  - 熱的原子振動
-  4. Thermal Fluctuation - 確率的閾値超え
-  5. Hooke        - 機械的変形
-  6. Lindemann    - 臨界判定（U²_c、λ）
+  1. Geometry          - 格子定数、原子間距離、数密度
+  2. Thermal Softening - 熱膨張による連続的な剛性低下
+  3. Born Collapse     - 構造依存の臨界崩壊係数（Z³スケーリング）
+  4. Debye-Waller      - 熱的原子振動（U²_thermal）
+  5. Thermal Fluctuation - 確率的閾値超え
+  6. Hooke             - 機械的変形（U²_mech）
+  7. Lindemann         - 臨界判定（U²_c、λ）
+
+重要な区別:
+  ┌────────────────────────────────────────────────────────────┐
+  │ Thermal Softening (連続的)                                  │
+  │   E(T)/E₀ = exp[-λ_eff × α × ΔT]                           │
+  │   格子が熱膨張で広がる → 結合弱化 → 剛性↓                   │
+  │   → U²_thermal の計算に反映（G(T)経由）                     │
+  ├────────────────────────────────────────────────────────────┤
+  │ Born Collapse (臨界的)                                      │
+  │   f_G = f_G⁰ × (Z_eff/12)³                                  │
+  │   格子が「壊れる」瞬間の構造依存係数                         │
+  │   → U²_c の計算に反映（Z³スケーリング）                     │
+  └────────────────────────────────────────────────────────────┘
 
 使用法:
-  from physics_engine import PhysicsEngine
-  from materials import get_material
+  from physics_engine import PhysicsEngine, create_engine
   
-  engine = PhysicsEngine(get_material('Cu'))
-  delta = engine.thermal_lindemann_ratio(1000)  # 1000Kでのδ
-  P = engine.probability_exceed_threshold(0.8, 500)  # λ=0.8, T=500K
+  engine = create_engine('Cu')
+  
+  # 熱軟化（連続的）
+  soft = engine.thermal_softening(1000)  # E(1000K)/E₀
+  
+  # Born崩壊係数（構造依存）
+  fG = engine.born_collapse_fG(Z_eff=8)  # BCC的な配位
+  
+  # 統合判定
+  lam = engine.compute_lambda(strain, T=500, Z_eff=Z_array)
 """
 
 import math
@@ -42,20 +62,22 @@ class PhysicsEngine:
     
     Core equations:
       Λ = K / |V|_eff = U² / U²_c
-      U²_c ∝ Z³ (critical displacement)
-      f_G ∝ Z³ (Born collapse factor)
       
-    Components:
-      - Born collapse (thermal softening)
-      - Debye-Waller (thermal vibration)
-      - Thermal fluctuation (stochastic barrier crossing)
-      - Hooke (mechanical strain)
-      - Lindemann criterion (stability)
+    二つの独立した効果:
+      1. Thermal Softening: G(T) = G₀ × exp[-λ_eff α ΔT]
+         → 連続的な剛性低下 → U²_thermal 増加
+         
+      2. Born Collapse: f_G = 0.097 × (Z_eff/12)³
+         → 構造依存の臨界閾値 → U²_c に反映
+    
+    λ判定:
+      λ = U²_total / U²_c
+      λ < 1: 安定
+      λ ≥ 1: 臨界（融解/破壊）
       
-    核心原理:
-      熱揺らぎは常に存在し、確率的にΛ=1を超える
-      室温でもσ_δ > 0、ただし小さいのでP_exceed ≈ 0
-      高温ではσ_δ大 → P_exceed増加 → クリープ/破壊
+    熱揺らぎ:
+      P_exceed = exp(-(1-λ)/σ_λ)
+      高温ではσ_λ大 → 確率的に閾値超え可能
     """
     
     # Z³スケーリング定数（7金属検証済み）
@@ -121,10 +143,17 @@ class PhysicsEngine:
     
     def _compute_fG_Z3(self) -> float:
         """
-        Z³スケーリングでBorn collapse係数を計算
+        融点での剛性率比 f_G = G(T_melt)/G₀
         
-        f_G = f_G_ref × (Z_eff / Z_ref)³
+        優先順位:
+          1. materials.pyに定義済みの fG_melt（実験値から逆算済み）
+          2. Z³スケーリングで計算（フォールバック）
         """
+        # 材料データに fG_melt があればそれを使う（検証済みの値）
+        if 'fG_melt' in self.mat:
+            return self.mat['fG_melt']
+        
+        # なければZ³スケーリングで計算（近似）
         return self.FG_FCC_REF * (self.Z_eff_bulk / self.Z_FCC_REF) ** 3
     
     # ========================================
@@ -180,18 +209,23 @@ class PhysicsEngine:
         return 4.0 / (a**3)
     
     # ========================================
-    # 2. Born Collapse（熱軟化）
+    # 2. 熱軟化（Thermal Softening）- 連続的
     # ========================================
     
-    def born_collapse_factor(self, T: float) -> float:
+    def thermal_softening(self, T: float) -> float:
         """
-        Born collapse係数 fG(T) - Λ³熱軟化モデル
+        熱膨張による剛性低下（連続的な効果）
         
         E(T)/E₀ = exp[-λ_eff × α × ΔT]
         
         where:
           λ_eff = λ_base × (1 + κ × ΔT/1000)
           ΔT = T - T_ref (T_ref = 293K)
+        
+        物理的意味:
+          - 格子が熱膨張で広がる → 結合弱化 → 剛性↓
+          - 融点 T_melt で fG_at_melt に到達（Born崩壊閾値）
+          - λ_base, κ は7金属フィッティングで決定済み
         """
         T_ref = 293.0
         
@@ -203,14 +237,86 @@ class PhysicsEngine:
         lambda_base = self.mat['lambda_base']
         kappa = self.mat['kappa']
         
+        # Λ³熱軟化モデル（7金属検証済み）
         lambda_eff = lambda_base * (1.0 + kappa * delta_T / 1000.0)
-        fG = math.exp(-lambda_eff * alpha * delta_T)
+        softening = math.exp(-lambda_eff * alpha * delta_T)
         
-        return max(fG, self.fG_at_melt)
+        # 融点でBorn崩壊閾値に達する
+        return max(softening, self.fG_at_melt)
+    
+    # ========================================
+    # 3. Born Collapse（臨界的崩壊）- Z³スケーリング
+    # ========================================
+    
+    def born_collapse_fG(self, Z_eff: float = None) -> float:
+        """
+        構造依存の臨界崩壊係数（Z³スケーリング）
+        
+        f_G = f_G⁰ × (Z_eff / 12)³
+        
+        f_G⁰ = 0.097 (FCC close-packed reference)
+        
+        物理的解釈:
+          Born崩壊 = 剛性率がゼロになる瞬間（格子の臨界的破壊）
+          Z³ = 3D剛性ネットワークの剛性浸透（rigidity percolation）
+            - Z¹: 結合エネルギー密度
+            - Z²: 角度拘束（せん断抵抗）
+            - Z³: 協同崩壊確率
+        
+        Returns:
+            f_G: 臨界崩壊係数（0～1、小さいほど壊れやすい）
+        """
+        if Z_eff is None:
+            Z_eff = self.Z_eff_bulk
+        
+        return self.FG_FCC_REF * (Z_eff / self.Z_FCC_REF) ** 3
+    
+    # ========================================
+    # 4. 弾性定数（熱軟化適用）
+    # ========================================
     
     def shear_modulus(self, T: float) -> float:
-        """温度依存の剛性率 G(T) = G₀ × fG(T)"""
-        return self.G0 * self.born_collapse_factor(T)
+        """
+        温度依存の剛性率 G(T)
+        
+        2つのレジーム:
+          T < 0.9 T_m:  Λ³ continuous softening (exponential)
+          T ≥ 0.9 T_m:  Born collapse (急降下 → fG_melt)
+        
+        図式:
+          G/G₀
+            │
+          1 ├● 300K
+            │ ╲
+            │  ╲  Λ³ softening (exp)
+            │   ╲
+            │    ╲___● 0.9 Tm
+            │        │ Born collapse
+            │        ●─── fG_melt
+          0 ├────────● Tm
+            └──────────→ T
+        """
+        T_ref = 293.0
+        T_melt = self.mat['T_melt']
+        T_born = 0.9 * T_melt  # Born collapse onset
+        
+        if T <= T_ref:
+            return self.G0
+        
+        if T >= T_melt:
+            return self.G0 * self.fG_at_melt
+        
+        if T < T_born:
+            # Region 1: Λ³ continuous softening (exponential)
+            f_T = self.thermal_softening(T)
+        else:
+            # Region 2: Born collapse (急降下)
+            # 0.9 T_m での値から fG_melt へ急降下
+            G_at_born = self.thermal_softening(T_born)
+            ratio = (T - T_born) / (T_melt - T_born)
+            f_T = G_at_born - (G_at_born - self.fG_at_melt) * ratio
+        
+        return self.G0 * f_T
     
     def bulk_modulus(self, T: float) -> float:
         """温度依存の体積弾性率 K(T)"""
@@ -393,13 +499,26 @@ class PhysicsEngine:
         
         return U2_thermal_arr + U2_mech, U2_thermal_arr, U2_mech
     
-    def critical_U2(self, Z_eff: np.ndarray = None) -> np.ndarray:
+    def critical_U2(self, Z_eff: np.ndarray = None, T: float = None) -> np.ndarray:
         """
-        臨界U²_c を計算
+        臨界U²_c を計算（Born崩壊閾値）
         
         U²_c = (δ_L × r_nn)² × (Z_eff / Z_bulk)³
+        
+        物理的解釈:
+          - δ_L: Lindemann定数（材料固有、0.1〜0.18）
+          - Z³: Born collapse（構造依存の剛性浸透）
+          
+        Note:
+          熱軟化はU²_thermal側に反映される（G(T)経由）
+          こちらは「壊れる閾値」なので温度に直接依存しない
+          
+        Args:
+            Z_eff: 有効配位数（表面/エッジで低下）
+            T: 温度（r_nnの熱膨張補正用、Noneなら300K）
         """
-        r_nn = self.nearest_neighbor_distance(300.0)
+        T_ref = T if T is not None else 300.0
+        r_nn = self.nearest_neighbor_distance(T_ref)
         U2_c_bulk = (self.mat['delta_L'] * r_nn)**2
         
         if Z_eff is None:
@@ -444,6 +563,57 @@ class PhysicsEngine:
         else:
             # Keeler-Brazier式（デフォルト）
             return (23.3 + 14.1 * thickness_mm) / 100.0
+    
+    def compute_FLC(self, thickness_mm: np.ndarray, minor_strain: np.ndarray) -> np.ndarray:
+        """
+        FLC（成形限界曲線）を計算
+        
+        Args:
+            thickness_mm: 板厚 [mm]（スカラーまたは配列）
+            minor_strain: マイナーひずみ ε₂
+        
+        Returns:
+            major_strain_limit: メジャーひずみ限界 ε₁
+        """
+        minor_strain = np.asarray(minor_strain)
+        thickness_mm = np.asarray(thickness_mm)
+        
+        if 'flc_points' in self.mat:
+            # 実データから補間
+            flc_points = sorted(self.mat['flc_points'], key=lambda x: x[0])
+            betas = np.array([p[0] for p in flc_points])
+            eps1s = np.array([p[1] for p in flc_points])
+            
+            # FLC₀を取得
+            flc0 = self.compute_FLC0(float(np.mean(thickness_mm)))
+            
+            # β推定
+            beta_estimated = minor_strain / np.maximum(np.abs(minor_strain) + flc0, 0.01)
+            beta_estimated = np.clip(beta_estimated, betas.min(), betas.max())
+            
+            # FLC値を補間
+            major_limit_ref = np.interp(beta_estimated, betas, eps1s)
+            
+            # 板厚補正
+            t_ref = self.mat.get('flc_t_ref', 1.96)
+            if np.isscalar(thickness_mm):
+                thickness_factor = math.sqrt(thickness_mm / t_ref)
+            else:
+                thickness_factor = np.sqrt(np.maximum(thickness_mm, 0.1) / t_ref)
+            
+            return major_limit_ref * thickness_factor
+        else:
+            # 線形近似
+            flc0 = self.compute_FLC0(float(np.mean(thickness_mm)))
+            left_slope = -1.0
+            right_slope = 0.55
+            
+            major_limit = np.where(
+                minor_strain < 0,
+                flc0 - left_slope * minor_strain,
+                flc0 + right_slope * minor_strain
+            )
+            return major_limit
     
     # ========================================
     # 診断
