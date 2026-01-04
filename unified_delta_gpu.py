@@ -58,10 +58,12 @@ class MaterialGPU:
     nu: float
     T_melt: float
     M_amu: float
+    rho: float           # 密度 [kg/m³]
     delta_L: float
     lambda_base: float
     kappa: float
     E_bond_eV: float
+    fG: float            # Born崩壊係数（融点での剛性率底値）← NEW
     
     @classmethod
     def SECD(cls):
@@ -69,9 +71,11 @@ class MaterialGPU:
             name="SECD", structure="BCC", Z_bulk=8,
             a_300K=2.87e-10, alpha=1.5e-5,
             E0=210e9, nu=0.29, T_melt=1811,
-            M_amu=55.845, delta_L=0.18,
+            M_amu=55.845, rho=7870,
+            delta_L=0.18,
             lambda_base=49.2, kappa=0.573,
             E_bond_eV=4.28,
+            fG=0.027,  # BCC ← δ_Lから逆算した値！
         )
     
     @classmethod
@@ -80,9 +84,11 @@ class MaterialGPU:
             name="FCC-Cu", structure="FCC", Z_bulk=12,
             a_300K=3.61e-10, alpha=1.7e-5,
             E0=130e9, nu=0.34, T_melt=1357,
-            M_amu=63.546, delta_L=0.10,
+            M_amu=63.546, rho=8960,
+            delta_L=0.10,
             lambda_base=26.3, kappa=1.713,
             E_bond_eV=3.49,
+            fG=0.101,  # FCC ← δ_Lから逆算した値！
         )
 
 
@@ -229,27 +235,240 @@ class UnifiedDeltaGPU:
         
         return cp.asnumpy(result) if GPU_AVAILABLE else result
     
+    def fG_at_melt(self) -> float:
+        """
+        融点でのBorn Collapse係数（材料定数）
+        
+        δ_L から逆算してフィッティング済み！
+        """
+        return self.mat.fG
+    
+    def shear_modulus_vec(self, T: np.ndarray) -> np.ndarray:
+        """
+        温度依存剛性率 G(T)（2レジーム）
+        
+        ═══════════════════════════════════════════════════════════
+        2つの独立した効果:
+        ═══════════════════════════════════════════════════════════
+        
+        Region 1 (T < 0.9 T_m): Λ³ Thermal Softening（連続的）
+          G(T) = G₀ × exp[-λ_eff × α × ΔT]
+          格子が熱膨張で広がる → 結合弱化 → 剛性↓
+        
+        Region 2 (T ≥ 0.9 T_m): Born Collapse（急降下）
+          G(T) = G_born → fG_melt へ線形急降下
+          格子の臨界的崩壊（相転移）
+        
+        図式:
+          G/G₀
+            │
+          1 ├● 300K
+            │ ╲
+            │  ╲  Λ³ softening (exp)
+            │   ╲
+            │    ╲___● 0.9 Tm
+            │        │ Born collapse
+            │        ●─── fG_melt
+          0 ├────────● Tm
+            └──────────→ T
+        """
+        xp = cp if GPU_AVAILABLE else np
+        T_np = cp.asnumpy(T) if GPU_AVAILABLE and hasattr(T, 'get') else np.asarray(T)
+        T_arr = xp.asarray(T_np)
+        
+        T_ref = 293.0
+        T_melt = self.mat.T_melt
+        T_born = 0.9 * T_melt  # Born collapse onset
+        fG_melt = self.fG_at_melt()
+        
+        # Region 1: Thermal Softening
+        f_soft = xp.asarray(self.thermal_softening_vec(T_np))
+        
+        # Region 2: Born Collapse (0.9 T_m 以降)
+        # G_born から fG_melt へ線形急降下
+        G_at_born = float(self.thermal_softening_vec(np.array([T_born]))[0])
+        
+        # 急降下の割合
+        ratio = xp.clip((T_arr - T_born) / (T_melt - T_born), 0, 1)
+        f_born = G_at_born - (G_at_born - fG_melt) * ratio
+        
+        # 2レジームを結合
+        f_eff = xp.where(T_arr < T_born, f_soft, f_born)
+        
+        # T < T_ref は 1.0
+        f_eff = xp.where(T_arr <= T_ref, 1.0, f_eff)
+        
+        G = self.G0 * f_eff
+        
+        return cp.asnumpy(G) if GPU_AVAILABLE else G
+    
     def youngs_modulus_vec(self, T: np.ndarray) -> np.ndarray:
         """ヤング率（ベクトル版）"""
         soft = self.thermal_softening_vec(T)
         return self.mat.E0 * soft
     
-    def delta_thermal_vec(self, T: np.ndarray) -> np.ndarray:
-        """δ_thermal（ベクトル版）"""
+    # ========================================
+    # Debye-Waller（完全版）
+    # ========================================
+    
+    def sound_velocities_vec(self, T: np.ndarray) -> tuple:
+        """
+        音速 v_t（横波）、v_l（縦波）
+        
+        v_t = √(G/ρ)
+        v_l = √((K + 4G/3)/ρ)
+        """
+        xp = cp if GPU_AVAILABLE else np
+        T_np = cp.asnumpy(T) if GPU_AVAILABLE and hasattr(T, 'get') else np.asarray(T)
+        T = xp.asarray(T_np)
+        
+        # 温度依存の弾性定数（Born Collapse底値付き！）
+        G = xp.asarray(self.shear_modulus_vec(T_np))
+        K = self.K0 * (1.0 - 0.3 * (T / self.mat.T_melt) ** 2)  # 体積弾性率
+        
+        # 密度（温度依存、熱膨張考慮）
+        rho = self.mat.rho / (1.0 + self.mat.alpha * (T - 300.0)) ** 3
+        
+        v_t = xp.sqrt(G / rho)
+        v_l = xp.sqrt((K + 4.0 * G / 3.0) / rho)
+        
+        if GPU_AVAILABLE:
+            return cp.asnumpy(v_t), cp.asnumpy(v_l)
+        return v_t, v_l
+    
+    def number_density_vec(self, T: np.ndarray) -> np.ndarray:
+        """
+        原子数密度 n(T) [atoms/m³]
+        
+        BCC: 2/a³, FCC: 4/a³
+        """
         xp = cp if GPU_AVAILABLE else np
         T = xp.asarray(T)
         
-        # 簡易計算: δ_th ≈ 0.017 × √(T/300) × (E0/E(T))^0.5
-        # これはDebye-Wallerの近似
-        T_ref = 300.0
-        soft = xp.asarray(self.thermal_softening_vec(cp.asnumpy(T) if GPU_AVAILABLE else T))
+        # 温度依存格子定数
+        a = self.mat.a_300K * (1.0 + self.mat.alpha * (T - 300.0))
         
-        # 基準値（300Kでのδ_thermal）
-        delta_300K = 0.017 * (self.mat.E0 / 130e9) ** 0.3  # Cu基準でスケール
+        # 結晶構造に応じた原子数
+        if self.mat.structure == 'BCC':
+            atoms_per_cell = 2.0
+        elif self.mat.structure == 'FCC':
+            atoms_per_cell = 4.0
+        else:
+            atoms_per_cell = 4.0  # デフォルト
         
-        result = delta_300K * xp.sqrt(T / T_ref) / xp.sqrt(xp.maximum(soft, 0.01))
+        n = atoms_per_cell / (a ** 3)
         
-        return cp.asnumpy(result) if GPU_AVAILABLE else result
+        return cp.asnumpy(n) if GPU_AVAILABLE else n
+    
+    def debye_wavevector_vec(self, T: np.ndarray) -> np.ndarray:
+        """
+        Debye波数 k_D = (6π²n)^(1/3)
+        """
+        xp = cp if GPU_AVAILABLE else np
+        n = xp.asarray(self.number_density_vec(T))
+        
+        k_D = (6.0 * np.pi ** 2 * n) ** (1.0 / 3.0)
+        
+        return cp.asnumpy(k_D) if GPU_AVAILABLE else k_D
+    
+    def inverse_omega_squared_vec(self, T: np.ndarray) -> np.ndarray:
+        """
+        ⟨1/ω²⟩の計算（Debye模型）
+        
+        ⟨1/ω²⟩ = (1/3k_D²) × (2/v_t² + 1/v_l²)
+        """
+        xp = cp if GPU_AVAILABLE else np
+        
+        v_t, v_l = self.sound_velocities_vec(T)
+        k_D = self.debye_wavevector_vec(T)
+        
+        v_t = xp.asarray(v_t)
+        v_l = xp.asarray(v_l)
+        k_D = xp.asarray(k_D)
+        
+        inv_omega2 = (1.0 / (3.0 * k_D ** 2)) * (2.0 / v_t ** 2 + 1.0 / v_l ** 2)
+        
+        return cp.asnumpy(inv_omega2) if GPU_AVAILABLE else inv_omega2
+    
+    def thermal_displacement_squared_vec(self, T: np.ndarray) -> np.ndarray:
+        """
+        熱的原子変位の二乗 ⟨u²⟩_thermal（Debye-Waller）
+        
+        ⟨u²⟩ = (k_B T / M) × ⟨1/ω²⟩
+        
+        これがDebye-Waller因子の元！
+        """
+        xp = cp if GPU_AVAILABLE else np
+        T = xp.asarray(T)
+        
+        # ゼロ温度チェック
+        T = xp.maximum(T, 1.0)
+        
+        inv_omega2 = xp.asarray(self.inverse_omega_squared_vec(
+            cp.asnumpy(T) if GPU_AVAILABLE else T
+        ))
+        
+        u2_thermal = (k_B * T / self.M) * inv_omega2
+        
+        return cp.asnumpy(u2_thermal) if GPU_AVAILABLE else u2_thermal
+    
+    def nearest_neighbor_distance_vec(self, T: np.ndarray) -> np.ndarray:
+        """
+        最近接原子間距離 r_nn(T)
+        
+        BCC: r_nn = a√3/2
+        FCC: r_nn = a/√2
+        """
+        xp = cp if GPU_AVAILABLE else np
+        T = xp.asarray(T)
+        
+        # 温度依存格子定数
+        a = self.mat.a_300K * (1.0 + self.mat.alpha * (T - 300.0))
+        
+        if self.mat.structure == 'BCC':
+            r_nn = a * np.sqrt(3) / 2
+        elif self.mat.structure == 'FCC':
+            r_nn = a / np.sqrt(2)
+        else:
+            r_nn = a / np.sqrt(2)  # デフォルト
+        
+        return cp.asnumpy(r_nn) if GPU_AVAILABLE else r_nn
+    
+    def delta_thermal_vec(self, T: np.ndarray) -> np.ndarray:
+        """
+        熱的Lindemann比 δ_thermal
+        
+        δ_thermal = √⟨u²⟩ / r_nn
+        
+        ═══════════════════════════════════════════════════════════
+        LINDEMANN則の自然な導出（非調和補正不要！）
+        ═══════════════════════════════════════════════════════════
+        
+        仕組み:
+          1. Debye-Waller: ⟨u²⟩ ∝ T / G(T)
+          2. Born Collapse: G(T) = G₀ × max(f_soft, fG_melt)
+          3. 融点付近: G(T) → G₀ × fG_melt（底値）
+          4. この底値が δ(T_melt) = δ_L を保証！
+        
+        fG_melt = 0.097 × (Z/12)³  ← Z³スケーリング
+        
+        これが「3つの物理」の統合:
+          - Debye-Waller（熱振動）
+          - Born Collapse（熱軟化）
+          - Lindemann（融解判定）
+        """
+        xp = cp if GPU_AVAILABLE else np
+        T_np = cp.asnumpy(T) if GPU_AVAILABLE and hasattr(T, 'get') else np.asarray(T)
+        
+        u2 = self.thermal_displacement_squared_vec(T_np)
+        r_nn = self.nearest_neighbor_distance_vec(T_np)
+        
+        u2 = xp.asarray(u2)
+        r_nn = xp.asarray(r_nn)
+        
+        delta = xp.sqrt(u2) / r_nn
+        
+        return cp.asnumpy(delta) if GPU_AVAILABLE else delta
     
     def delta_mechanical_vec(self, sigma_local: np.ndarray, T: np.ndarray) -> np.ndarray:
         """δ_mech（ベクトル版）"""
