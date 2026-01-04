@@ -90,6 +90,10 @@ class TensileTestSimulator:
         self.X = self.positions.copy()  # 参照座標
         self.R0 = self._compute_all_vectors(self.X)  # 参照ベクトル
         
+        # 融解状態トラッキング（カスケード崩壊用）
+        self.is_molten = np.zeros(self.N, dtype=bool)  # 融解フラグ
+        self.Z_eff_initial = self.Z_eff.copy()  # 初期Z_eff保存
+        
         # 累積量
         self.U2_cumul = np.zeros(self.N)
         self.strain_history = []
@@ -161,6 +165,76 @@ class TensileTestSimulator:
                 self.Z_eff[i] = self.mat.Z_bulk * 0.5   # エッジ
             else:
                 self.Z_eff[i] = self.mat.Z_bulk * 0.375 # コーナー
+    
+    def update_Z_eff_after_melting(self, newly_molten_mask: np.ndarray):
+        """
+        融解した原子の隣接原子のZ_effを再計算
+        
+        融解 = 格子点が「消える」
+        → 隣の原子のZ_effが低下
+        → U²_c ∝ Z³ で急激に壊れやすく
+        """
+        # 融解フラグを更新
+        self.is_molten |= newly_molten_mask
+        
+        # 全原子のZ_effを再計算
+        for i in range(self.N):
+            if self.is_molten[i]:
+                # 融解した原子はZ=0
+                self.Z_eff[i] = 0.0
+            else:
+                # 隣接原子のうち、融解していないものをカウント
+                neighbors_i = self.neighbors[i]
+                n_active = 0
+                for j in neighbors_i:
+                    if not self.is_molten[j]:
+                        n_active += 1
+                
+                # 初期Z_effを基準に、失った隣接数分を減算
+                n_lost = len(neighbors_i) - n_active
+                Z_reduction = n_lost * (self.Z_eff_initial[i] / len(neighbors_i)) if len(neighbors_i) > 0 else 0
+                
+                self.Z_eff[i] = max(self.Z_eff_initial[i] - Z_reduction, 0.1)  # 最小0.1
+    
+    def cascade_melting(self, U2_total: np.ndarray, max_iterations: int = 10) -> np.ndarray:
+        """
+        1ステップ内でのカスケード融解
+        
+        Corner融解 → 隣のZ低下 → 隣も融解 → ...
+        連鎖的な崩壊を1ステップ内で計算
+        
+        Returns:
+            lambda: 最終的なλ値
+        """
+        n_molten_prev = self.is_molten.sum()
+        
+        for iteration in range(max_iterations):
+            # 現在のZ_effでU²_cを計算
+            U2_c = self.physics.critical_U2(self.Z_eff)
+            
+            # λを計算（融解原子はλ=∞扱い）
+            lam = np.where(
+                self.is_molten,
+                np.inf,  # 既に融解
+                U2_total / np.maximum(U2_c, 1e-30)
+            )
+            
+            # 新しく融解する原子（λ ≥ 1 かつ まだ融解していない）
+            newly_molten = (lam >= 1.0) & (~self.is_molten)
+            
+            if not newly_molten.any():
+                break  # 収束、新しい融解なし
+            
+            # Z_effを更新（これが連鎖のトリガー）
+            self.update_Z_eff_after_melting(newly_molten)
+        
+        n_molten_now = self.is_molten.sum()
+        n_cascade = n_molten_now - n_molten_prev
+        
+        if n_cascade > 0:
+            print(f"    [Cascade] +{n_cascade} atoms melted in {iteration+1} iterations")
+        
+        return lam
     
     def _compute_all_vectors(self, positions: np.ndarray) -> np.ndarray:
         """全近傍ベクトルを計算"""
@@ -346,9 +420,10 @@ class TensileTestSimulator:
         # 注: 引張試験では累積しない（参照状態からの変形を直接見る）
         # プレス成形では累積が必要だが、引張は参照→現在の直接比較
         
-        # 6. λ計算（物理エンジン）
-        U2_c = self.physics.critical_U2(self.Z_eff)
-        lam = U2_total / np.maximum(U2_c, 1e-30)
+        # 6. λ計算 + カスケード融解
+        # Z_effが動的に更新され、連鎖的崩壊が計算される
+        lam = self.cascade_melting(U2_total)
+        U2_c = self.physics.critical_U2(self.Z_eff)  # 更新後のZ_effで再計算
         
         # 7. 体積ひずみ
         vol_strain = self.compute_volumetric_strain(E)
@@ -391,6 +466,9 @@ class TensileTestSimulator:
             'delta_thermal': delta_thermal,
             'delta_mech': delta_mech,
             'T': T,
+            'is_molten': self.is_molten.copy(),  # 融解状態
+            'Z_eff': self.Z_eff.copy(),  # 更新後のZ_eff
+            'n_molten': self.is_molten.sum(),  # 融解原子数
         }
     
     def run_full_test(self, 
@@ -569,8 +647,8 @@ if __name__ == "__main__":
     
     # 結果を可視化
     fig = sim.plot_results(results_300K)
-    fig.savefig('/content/tensile_test_v2_300K.png', dpi=150)
-    print(f"\nSaved: /contents/tensile_test_v2_300K.png")
+    fig.savefig('/content/outputs/tensile_test_v2_300K.png', dpi=150)
+    print(f"\nSaved: /content/outputs/tensile_test_v2_300K.png")
     
     # 高温試験
     print("\n### High Temperature Test (T=1000K) ###")
@@ -587,8 +665,8 @@ if __name__ == "__main__":
     )
     
     fig2 = sim2.plot_results(results_1000K)
-    fig2.savefig('/content/tensile_test_v2_1000K.png', dpi=150)
-    print(f"Saved: /content/tensile_test_v2_1000K.png")
+    fig2.savefig('/content/outputs/tensile_test_v2_1000K.png', dpi=150)
+    print(f"Saved: /content/outputs/tensile_test_v2_1000K.png")
     
     # サマリ
     print("\n" + "="*70)
