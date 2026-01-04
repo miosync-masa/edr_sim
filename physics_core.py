@@ -176,13 +176,22 @@ class PhysicsEngine:
     Components:
       - Born collapse (thermal softening)
       - Debye-Waller (thermal vibration)
+      - Thermal fluctuation (stochastic barrier crossing)
       - Hooke (mechanical strain)
       - Lindemann criterion (stability)
+      
+    核心原理：
+      熱揺らぎは常に存在し、確率的にΛ=1を超える
+      室温でもσ_δ > 0、ただし小さいのでP_exceed ≈ 0
+      高温ではσ_δ大 → P_exceed増加 → クリープ/破壊
     """
     
     # Z³ scaling constants (from 7-metal validation)
     FG_FCC_REF = 0.097   # Reference: FCC at Z=12
     Z_FCC_REF = 12       # Reference coordination
+    
+    # 熱揺らぎの物理定数
+    NU_0 = 1e13  # Debye周波数（試行頻度）[Hz]
     
     def __init__(self, material: MaterialPhysics):
         self.mat = material
@@ -438,6 +447,127 @@ class PhysicsEngine:
         r_nn = self.nearest_neighbor_distance(T)
         
         return math.sqrt(u2) / r_nn
+    
+    # ========================================
+    # 3.5 Thermal Fluctuation（熱揺らぎの確率論）
+    # ========================================
+    
+    def thermal_fluctuation_sigma(self, T: float) -> float:
+        """
+        熱揺らぎの標準偏差 σ_δ
+        
+        熱揺らぎの幅は温度に依存:
+          σ_δ ≈ δ_thermal
+          
+        高温: σ_δ大 → 確率的にΛ>1を超えやすい
+        低温: σ_δ小 → 確率的にΛ>1を超えにくい
+        
+        Returns:
+            σ_δ: 熱揺らぎの幅（無次元）
+        """
+        return self.thermal_lindemann_ratio(T)
+    
+    def lambda_fluctuation_sigma(self, lam: float, T: float) -> float:
+        """
+        Λの揺らぎの標準偏差 σ_Λ
+        
+        Λ = (δ/δ_L)² なので、δの揺らぎがΛの揺らぎに変換される
+        
+        δ = δ_L × √Λ より
+        dΛ/dδ = 2δ / δ_L² = 2√Λ / δ_L
+        
+        σ_Λ = |dΛ/dδ| × σ_δ = 2√Λ / δ_L × σ_δ
+        
+        Args:
+            lam: 現在のΛ値
+            T: 温度 [K]
+            
+        Returns:
+            σ_Λ: Λの揺らぎ幅
+        """
+        sigma_delta = self.thermal_fluctuation_sigma(T)
+        delta_L = self.mat.delta_L  # Lindemann定数（0.1程度）
+        
+        # Λ = (δ/δ_L)² の微分より
+        # σ_Λ = 2√Λ / δ_L × σ_δ
+        sigma_lam = 2.0 * math.sqrt(max(lam, 0.01)) / delta_L * sigma_delta
+        
+        return sigma_lam
+    
+    def probability_exceed_threshold(self, lam: float, T: float, threshold: float = 1.0) -> float:
+        """
+        熱揺らぎにより閾値を超える確率 P_exceed
+        
+        熱揺らぎの分布の裾野が threshold を超える確率
+        
+        P_exceed = exp(-gap / σ_Λ)  if gap > 0
+                 = 1.0               if gap <= 0
+        
+        where gap = threshold - lam
+        
+        Args:
+            lam: 現在のΛ値
+            T: 温度 [K]
+            threshold: 閾値（デフォルト=1.0）
+            
+        Returns:
+            P_exceed: 閾値を超える確率 [0, 1]
+        """
+        gap = threshold - lam
+        
+        if gap <= 0:
+            return 1.0  # 既に閾値以上
+        
+        sigma_lam = self.lambda_fluctuation_sigma(lam, T)
+        
+        if sigma_lam < 1e-10:
+            return 0.0  # 揺らぎがない（極低温）
+        
+        # ボルツマン的な確率分布の裾野
+        P_exceed = math.exp(-gap / sigma_lam)
+        
+        return min(P_exceed, 1.0)
+    
+    def jump_rate(self, lam: float, Z_eff: float, T: float) -> float:
+        """
+        熱活性化ジャンプレート [1/s]
+        
+        Arrhenius則 + 熱揺らぎによる閾値超え確率
+        
+        rate = ν₀ × exp(-E_barrier / kT) × P_exceed
+        
+        E_barrier ∝ Z_eff × |V| (結合エネルギー)
+        
+        Args:
+            lam: 現在のΛ値
+            Z_eff: 有効配位数
+            T: 温度 [K]
+            
+        Returns:
+            rate: ジャンプレート [1/s]
+        """
+        if T <= 0:
+            return 0.0
+        
+        # 閾値を超える確率
+        P_exceed = self.probability_exceed_threshold(lam, T)
+        
+        if P_exceed < 1e-20:
+            return 0.0  # 事実上ゼロ
+        
+        # エネルギー障壁（Z_effに比例）
+        # E_barrier ≈ (1 - lam) × Z_eff × k_B × T_melt
+        gap = max(1.0 - lam, 0.01)
+        E_barrier = gap * (Z_eff / 12.0) * k_B * self.mat.T_melt
+        
+        # Arrhenius
+        kT = k_B * T
+        if E_barrier / kT > 100:
+            return 0.0  # 事実上ゼロ
+        
+        rate = self.NU_0 * math.exp(-E_barrier / kT) * P_exceed
+        
+        return rate
     
     # ========================================
     # 4. Hooke（機械的変形）
