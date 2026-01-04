@@ -326,13 +326,13 @@ class MultiStepAnalyzer:
     **同一材料点の歪み累積**を実装
     """
     
-    def __init__(self, material: Material, thickness_mm: float = 1.96):
+    def __init__(self, engine: PhysicsEngine, thickness_mm: float = 1.96):
         """
         Args:
-            material: 材料オブジェクト
+            engine: PhysicsEngineオブジェクト
             thickness_mm: 初期板厚 [mm]
         """
-        self.material = material
+        self.engine = engine
         self.thickness = thickness_mm
         self.step_results = []
     
@@ -397,7 +397,7 @@ class MultiStepAnalyzer:
             print(f"\n--- Analyzing Step {i+1} ---")
             
             # U²エンジンを初期化
-            engine = U2Engine(self.material, mesh, self.thickness)
+            u2_engine = U2Engine(self.engine, mesh, self.thickness)
             
             # 前工程からの累積歪みをマッピング
             if prev_mesh is not None and cumulative_strain is not None:
@@ -412,7 +412,7 @@ class MultiStepAnalyzer:
                 total_strain_minor = mapped_strain_minor + strain_info['vertex_strain'] * (-0.3)
                 
                 # 板厚も引き継ぎ（さらに薄くなる）
-                engine.thickness = mapped_thickness
+                u2_engine.thickness = mapped_thickness
                 
                 print(f"  Cumulative strain: max={total_strain.max():.3f}, mean={total_strain.mean():.3f}")
             else:
@@ -420,16 +420,16 @@ class MultiStepAnalyzer:
                 total_strain_minor = strain_info['vertex_strain'] * (-0.3)
             
             # 歪み場を設定
-            engine.set_strain_field(total_strain, strain_minor=total_strain_minor)
+            u2_engine.set_strain_field(total_strain, strain_minor=total_strain_minor)
             
             # λ（リスク）を計算
-            risk = engine.get_risk_map()
+            risk = u2_engine.get_risk_map()
             
             # Born崩壊カスケード
-            n_collapsed = engine.run_born_cascade()
+            n_collapsed = u2_engine.run_born_cascade()
             
             # サマリを取得
-            summary = engine.summary()
+            summary = u2_engine.summary()
             summary['step'] = i + 1
             summary['n_born_collapsed'] = n_collapsed
             
@@ -438,7 +438,7 @@ class MultiStepAnalyzer:
             summary['cumulative_strain_mean'] = total_strain.mean()
             
             # 高リスク領域を特定
-            high_risk_mask = (risk > 0.8) & ~engine.collapsed
+            high_risk_mask = (risk > 0.8) & ~u2_engine.collapsed
             summary['n_high_risk'] = high_risk_mask.sum()
             summary['high_risk_ratio'] = high_risk_mask.sum() / mesh.n_vertices
             
@@ -451,7 +451,7 @@ class MultiStepAnalyzer:
             results.append({
                 'summary': summary,
                 'risk_map': risk.copy(),
-                'engine': engine,
+                'engine': u2_engine,
                 'mesh': mesh,
                 'cumulative_strain': total_strain.copy(),
             })
@@ -459,7 +459,7 @@ class MultiStepAnalyzer:
             # 次工程のために保存
             cumulative_strain = total_strain.copy()
             cumulative_strain_minor = total_strain_minor.copy()
-            cumulative_thickness = engine.thickness.copy()
+            cumulative_thickness = u2_engine.thickness.copy()
             prev_mesh = mesh
             
             # 結果を表示
@@ -476,6 +476,7 @@ class MultiStepAnalyzer:
 if __name__ == "__main__":
     from mesh_loader import load_dxf
     from strain_calc import estimate_strain_from_geometry
+    from physics_engine import create_engine
     
     # テスト
     files = [
@@ -494,12 +495,11 @@ if __name__ == "__main__":
     print("\nComputing strain history...")
     strain_history = estimate_strain_from_geometry(meshes)
     
-    # 材料を設定
-    material = Material('SECD')
-    print(f"\nMaterial: {material}")
+    # 物理エンジンを作成
+    physics = create_engine('SECD')
     
     # 解析実行
-    analyzer = MultiStepAnalyzer(material)
+    analyzer = MultiStepAnalyzer(physics)
     results = analyzer.analyze_process(meshes, strain_history)
     
     print("\n" + "="*60)
