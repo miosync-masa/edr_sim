@@ -28,6 +28,7 @@ class MaterialPhysics:
     
     Born collapse、Debye、Hookeに必要な全パラメータ
     Z³スケーリング対応
+    Λ³熱軟化モデル対応（λ_base, κ）
     """
     name: str
     
@@ -52,6 +53,10 @@ class MaterialPhysics:
     # Lindemann定数
     delta_L: float       # 臨界δ
     
+    # Λ³熱軟化パラメータ（7材料フィッティング済み）
+    lambda_base: float = 30.0  # 基準減衰係数（デフォルト: BCC/FCC平均）
+    kappa: float = 2.0         # 非調和パラメータ（デフォルト）
+    
     @classmethod
     def BCC_Fe(cls):
         """BCC鉄（α-Fe）"""
@@ -60,7 +65,7 @@ class MaterialPhysics:
             structure="BCC",
             Z_bulk=8,
             a_300K=2.87e-10,
-            alpha=1.2e-5,
+            alpha=1.5e-5,  # 15e-6 from fitting data
             c_over_a=0.0,
             E0=210e9,
             nu=0.29,
@@ -68,6 +73,9 @@ class MaterialPhysics:
             M_amu=55.845,
             rho=7870,
             delta_L=0.18,
+            # Λ³ fitted parameters
+            lambda_base=49.2,
+            kappa=0.573,
         )
     
     @classmethod
@@ -86,6 +94,9 @@ class MaterialPhysics:
             M_amu=63.546,
             rho=8960,
             delta_L=0.10,
+            # Λ³ fitted parameters
+            lambda_base=26.3,
+            kappa=1.713,
         )
     
     @classmethod
@@ -104,6 +115,9 @@ class MaterialPhysics:
             M_amu=26.982,
             rho=2700,
             delta_L=0.11,
+            # Λ³ fitted parameters
+            lambda_base=27.3,
+            kappa=4.180,
         )
     
     @classmethod
@@ -122,6 +136,9 @@ class MaterialPhysics:
             M_amu=47.867,
             rho=4506,
             delta_L=0.10,
+            # Λ³ fitted parameters
+            lambda_base=43.1,
+            kappa=0.771,
         )
     
     @classmethod
@@ -132,7 +149,7 @@ class MaterialPhysics:
             structure="HCP",
             Z_bulk=12,
             a_300K=3.21e-10,
-            alpha=2.7e-5,
+            alpha=2.6e-5,  # フィッティングデータに合わせる
             c_over_a=1.624,
             E0=45e9,
             nu=0.29,
@@ -140,6 +157,9 @@ class MaterialPhysics:
             M_amu=24.305,
             rho=1738,
             delta_L=0.117,
+            # Λ³ fitted parameters (Mg has high κ due to anharmonicity)
+            lambda_base=7.5,
+            kappa=37.568,
         )
 
 
@@ -290,22 +310,35 @@ class PhysicsEngine:
     
     def born_collapse_factor(self, T: float) -> float:
         """
-        Born collapse係数 fG(T)
+        Born collapse係数 fG(T) - Λ³熱軟化モデル
         
-        Z³スケーリング:
-          f_G(T_melt) = 0.097 × (Z_eff/12)³
+        E(T)/E₀ = exp[-λ_eff × α × ΔT]
         
-        温度依存性:
-          fG(T) = 1 - (1 - fG_melt) × (T / T_melt)²
+        where:
+          λ_eff = λ_base × (1 + κ × ΔT/1000)
+          ΔT = T - T_ref (T_ref = 293K)
         
-        T = 300K: fG ≈ 1 (ほぼそのまま)
-        T = T_melt: fG = fG_melt (Z³で決まる)
+        Parameters from 7-material fitting:
+          Fe:  λ=49.2, κ=0.573  (Residual 1.5%)
+          Cu:  λ=26.3, κ=1.713  (Residual 0.3%)
+          Al:  λ=27.3, κ=4.180  (Residual 1.1%)
+          Ti:  λ=43.1, κ=0.771  (Residual 0.3%)
+          Mg:  λ=7.5,  κ=37.57  (Residual 2.1%)
         """
-        if T <= 0:
+        T_ref = 293.0  # 参照温度 [K]
+        
+        if T <= T_ref:
             return 1.0
         
-        T_ratio = min(T / self.mat.T_melt, 1.0)
-        fG = 1.0 - (1.0 - self.fG_at_melt) * (T_ratio ** 2)
+        delta_T = T - T_ref
+        
+        # 非調和補正付き有効λ
+        lambda_eff = self.mat.lambda_base * (1.0 + self.mat.kappa * delta_T / 1000.0)
+        
+        # Λ³熱軟化
+        fG = math.exp(-lambda_eff * self.mat.alpha * delta_T)
+        
+        # Z³スケーリングの下限を保証（融点では少なくともfG_at_melt）
         return max(fG, self.fG_at_melt)
     
     def shear_modulus(self, T: float) -> float:
