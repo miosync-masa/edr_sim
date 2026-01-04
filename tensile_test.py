@@ -22,7 +22,8 @@ from typing import Tuple, List
 from enum import Enum
 
 # 統合物理エンジンをインポート
-from physics_core import PhysicsEngine, MaterialPhysics
+from physics_engine import PhysicsEngine
+from materials import get_material
 
 # CuPyが使えればGPU、なければCPU
 try:
@@ -58,12 +59,12 @@ class TensileTestSimulator:
                  Ly: float = 50.0,  # mm  
                  Lz: float = 10.0,  # mm
                  spacing: float = 1.0,  # mm (シミュレーション格子)
-                 material: MaterialPhysics = None):
+                 material: dict = None):
         """
         Args:
             Lx, Ly, Lz: 試験片サイズ [mm]
             spacing: 格子点間隔 [mm]
-            material: 材料（MaterialPhysics）
+            material: 材料（get_material()の戻り値）
         """
         self.Lx = Lx
         self.Ly = Ly
@@ -71,7 +72,7 @@ class TensileTestSimulator:
         self.spacing = spacing
         
         # 物理エンジン初期化
-        self.mat = material or MaterialPhysics.FCC_Cu()  # 銅でテスト（検証済み）
+        self.mat = material or get_material('Cu')  # 銅でテスト（検証済み）
         self.physics = PhysicsEngine(self.mat)
         
         print(f"\nSpecimen: {Lx} x {Ly} x {Lz} mm")
@@ -146,7 +147,7 @@ class TensileTestSimulator:
         # 表面/エッジ/コーナー判定
         tol = self.spacing * 0.1
         
-        self.Z_eff = np.full(self.N, self.mat.Z_bulk, dtype=float)
+        self.Z_eff = np.full(self.N, self.mat['Z_bulk'], dtype=float)
         
         for i in range(self.N):
             x, y, z = self.positions[i]
@@ -158,13 +159,13 @@ class TensileTestSimulator:
             if z < tol or z > self.Lz - tol: n_boundaries += 1
             
             if n_boundaries == 0:
-                self.Z_eff[i] = self.mat.Z_bulk  # バルク
+                self.Z_eff[i] = self.mat['Z_bulk']  # バルク
             elif n_boundaries == 1:
-                self.Z_eff[i] = self.mat.Z_bulk * 0.75  # 面
+                self.Z_eff[i] = self.mat['Z_bulk'] * 0.75  # 面
             elif n_boundaries == 2:
-                self.Z_eff[i] = self.mat.Z_bulk * 0.5   # エッジ
+                self.Z_eff[i] = self.mat['Z_bulk'] * 0.5   # エッジ
             else:
-                self.Z_eff[i] = self.mat.Z_bulk * 0.375 # コーナー
+                self.Z_eff[i] = self.mat['Z_bulk'] * 0.375 # コーナー
     
     def update_Z_eff_after_melting(self, newly_molten_mask: np.ndarray):
         """
@@ -196,16 +197,20 @@ class TensileTestSimulator:
                 
                 self.Z_eff[i] = max(self.Z_eff_initial[i] - Z_reduction, 0.1)  # 最小0.1
     
-    def cascade_melting(self, U2_total: np.ndarray, max_iterations: int = 10) -> np.ndarray:
+    def cascade_melting(self, U2_total: np.ndarray, max_iterations: int = 2) -> np.ndarray:
         """
-        1ステップ内でのカスケード融解
+        1ステップ内でのカスケード融解（制限付き）
         
-        Corner融解 → 隣のZ低下 → 隣も融解 → ...
-        連鎖的な崩壊を1ステップ内で計算
+        物理的制約:
+          - 1ステップ内での連鎖は最近接1〜2層のみ
+          - 遠くへの伝播には追加エネルギー（ひずみ増加）が必要
+          - カスケード閾値 λ ≥ 1.2（余裕を持って崩壊開始）
         
         Returns:
             lambda: 最終的なλ値
         """
+        CASCADE_THRESHOLD = 1.2  # カスケードで崩壊するにはλが十分高くないと
+        
         n_molten_prev = self.is_molten.sum()
         
         for iteration in range(max_iterations):
@@ -219,8 +224,11 @@ class TensileTestSimulator:
                 U2_total / np.maximum(U2_c, 1e-30)
             )
             
-            # 新しく融解する原子（λ ≥ 1 かつ まだ融解していない）
-            newly_molten = (lam >= 1.0) & (~self.is_molten)
+            # 新しく融解する原子
+            # 初回(iteration=0): λ ≥ 1.0 で融解（通常判定）
+            # カスケード(iteration>0): λ ≥ CASCADE_THRESHOLD で融解（より厳しく）
+            threshold = 1.0 if iteration == 0 else CASCADE_THRESHOLD
+            newly_molten = (lam >= threshold) & (~self.is_molten)
             
             if not newly_molten.any():
                 break  # 収束、新しい融解なし
@@ -612,7 +620,7 @@ class TensileTestSimulator:
             ax6.legend()
             ax6.grid(True, alpha=0.3)
         
-        plt.suptitle(f'Λ³-Dynamics Tensile Test: {self.mat.name}', 
+        plt.suptitle(f'Λ³-Dynamics Tensile Test: {self.mat['name']}', 
                      fontsize=14, fontweight='bold')
         plt.tight_layout()
         
@@ -634,7 +642,7 @@ if __name__ == "__main__":
         Ly=50.0,   # mm
         Lz=10.0,   # mm
         spacing=2.0,  # mm
-        material=MaterialPhysics.FCC_Cu()
+        material=get_material('Cu')
     )
     
     # 引張試験実行（室温）
@@ -647,15 +655,15 @@ if __name__ == "__main__":
     
     # 結果を可視化
     fig = sim.plot_results(results_300K)
-    fig.savefig('/content/outputs/tensile_test_v2_300K.png', dpi=150)
-    print(f"\nSaved: /content/outputs/tensile_test_v2_300K.png")
+    fig.savefig('/mnt/user-data/outputs/tensile_test_v2_300K.png', dpi=150)
+    print(f"\nSaved: /mnt/user-data/outputs/tensile_test_v2_300K.png")
     
     # 高温試験
     print("\n### High Temperature Test (T=1000K) ###")
     sim2 = TensileTestSimulator(
         Lx=10.0, Ly=50.0, Lz=10.0,
         spacing=2.0,
-        material=MaterialPhysics.FCC_Cu()
+        material=get_material('Cu')
     )
     
     results_1000K = sim2.run_full_test(
@@ -665,8 +673,8 @@ if __name__ == "__main__":
     )
     
     fig2 = sim2.plot_results(results_1000K)
-    fig2.savefig('/content/outputs/tensile_test_v2_1000K.png', dpi=150)
-    print(f"Saved: /content/outputs/tensile_test_v2_1000K.png")
+    fig2.savefig('/mnt/user-data/outputs/tensile_test_v2_1000K.png', dpi=150)
+    print(f"Saved: /mnt/user-data/outputs/tensile_test_v2_1000K.png")
     
     # サマリ
     print("\n" + "="*70)
